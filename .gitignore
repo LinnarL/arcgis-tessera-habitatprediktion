@@ -1,0 +1,32 @@
+# Fynddata och annat källmaterial. Observationsdata hör inte hemma i repot.
+Förekomsttabell/
+*.xlsx
+*.xls
+*.csv
+
+# Nedladdade Tessera-filer och arbetsfiler
+Tessera_nedladdning/
+TesseraHabitat_arbetsmapp*/
+cache/
+*.npy
+*.tif
+*.tiff
+*.shp
+*.shx
+*.dbf
+*.prj
+*.cpg
+
+# Geodatabaser och utdata
+*.gdb/
+
+# Python
+__pycache__/
+*.pyc
+
+# ArcGIS
+*.lock
+*.aprx.bak
+
+# Esri-genererade metadatastubbar
+*.pyt.xml
