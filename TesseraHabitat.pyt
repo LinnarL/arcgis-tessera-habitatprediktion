@@ -6,34 +6,40 @@ Habitatprediktion ur Tessera-embeddings: utgå från kända fyndpunkter för en 
 hämta embedding-vektorn i varje fyndpunkt, och måla ut ett likhetsraster över ett
 sökområde så att platser som liknar de kända lokalerna framträder.
 
-Fyndpunkterna hämtas direkt ur Tesseras publicerade filer med Range-anrop i
-stället för att ladda ned hela tiles. En tile är ca 90 MB, och fynddata för en
-art ligger typiskt utspridda över en hel region — en tile per fynd hade gjort
-arbetsflödet praktiskt omöjligt. Filformatet är okomprimerad .npy, så en enskild
-pixel kan läsas ut med ett byte-intervall:
+Vilka tiles som finns, var de ligger och vilka år som är publicerade kommer från
+biblioteket geotessera, som också hämtar landmaskerna. Själva fyndpunkterna läses
+däremot med Range-anrop direkt ur Tesseras filer, inte via geotessera: en tile är
+ca 90 MB och geotessera hämtar alltid hela tiles, medan fynddata för en art ligger
+utspridda över en hel region. Ett fynd kostar två små anrop i stället för 90 MB,
+och den skillnaden är hela förutsättningen för verktyget.
 
-    npy/{version}/{år}/grid_{lon}_{lat}/grid_{lon}_{lat}.npy
+Filformatet är okomprimerad .npy, så en enskild pixel kan läsas ut med ett
+byte-intervall:
+
+    .../{år}/grid_{lon}_{lat}/grid_{lon}_{lat}.npy
         .npy-huvud (128 byte) + int8 i C-ordning, form (H, W, 128)
         pixelns vektor = 128 byte på offset huvud + (rad * W + kolumn) * 128
 
-    npy/{version}/{år}/grid_{lon}_{lat}/grid_{lon}_{lat}_scales.npy
+    .../{år}/grid_{lon}_{lat}/grid_{lon}_{lat}_scales.npy
         .npy-huvud (128 byte) + float32 i C-ordning, form (H, W)
         pixelns skalfaktor = 4 byte på offset huvud + (rad * W + kolumn) * 4
 
-    landmasks/{version}/grid_{lon}_{lat}.tiff
-        13,6 kB, och den enda källan till tilens koordinatsystem och origo
+    landmasken för tilen, 13,6 kB, hämtas via geotessera och är den enda
+    källan till tilens koordinatsystem och origo
 
 Embeddingen är kvantiserad som int8 med en skalfaktor per pixel — en enda skalär
 för alla 128 kanaler — så det verkliga värdet är int8 * scale. Kostnaden per
 fyndpunkt blir två små anrop, plus en landmask per tile som återanvänds ur cachen.
 
-Två uppmätta egenheter hos servern som koden måste ta hänsyn till:
+Uppmätt egenhet hos servern som koden måste ta hänsyn till:
 
-  * Utan User-Agent-huvud svarar servern HTTP 403.
   * Flerdelade Range-huvuden ("bytes=a-b, c-d") ignoreras: servern svarar 200 med
     hela filen i stället för 206 med delarna. Varje läsning kontrollerar därför
     att statuskoden är 206 innan kroppen läses, och varje sammanhängande löpa
-    hämtas med ett eget anrop.
+    hämtas med ett eget anrop. Utan den kontrollen blir en avsedd 128-byteläsning
+    en nedladdning av hela tilen. Kontrollerat mot S3-adressen; kravet på
+    User-Agent gällde den tidigare spegeln på data.source.coop och finns inte här,
+    men huvudet skickas ändå.
 
 Likhetsberäkningen är densamma som i "Tessera similarity search" i denna mapp:
 skalärprodukten mellan pixelns vektor och referensvektorn, med normering ger det
@@ -47,9 +53,11 @@ embedding-rummet. Standardvalet här är därför "största likhet mot någon
 fyndpunkt": varje pixel jämförs med samtliga fynd och behåller sin bästa
 träff, vilket bevarar flera habitat i stället för att medelvärdesbilda bort dem.
 
-Källa : https://data.source.coop/tessera/tessera  (https://geotessera.org/)
-Krav  : ArcGIS Pro 3.x (arcpy). Inga paket utöver Pythons standardbibliotek
-        och numpy.
+Källa : https://geotessera.org/  (data via s3://tessera-embeddings)
+Krav  : ArcGIS Pro 3.x (arcpy), numpy och geotessera.
+        geotessera finns inte i standardmiljön arcgispro-py3. Klona miljön och
+        installera paketet, t.ex. arcgispro-py3-personal, och peka Pro på den
+        kloningen innan verktygslådan används.
 """
 
 import ast
@@ -67,21 +75,28 @@ import numpy as np
 
 import arcpy
 
+try:
+    from geotessera import GeoTessera
+    from geotessera import registry as gt_registry
+    _GEOTESSERA_ERROR = None
+except Exception as _exc:                                   # noqa: BLE001
+    GeoTessera = None
+    gt_registry = None
+    _GEOTESSERA_ERROR = _exc
+
 # ── Konstanter ────────────────────────────────────────────────────────────────
 
 WGS84_WKID = 4326
 
-BASE_URL = "https://data.source.coop/tessera/tessera"
-
 TILE_DEG = 0.1          # tile-sida i grader
 N_CHANNELS = 128        # kanaler per pixel i Tessera-embeddingen
 
-# Dataset-versioner: etikett -> (katalog i npy/, katalog i landmasks/).
+# Dataset-versioner: etikett -> (version, variant) som geotessera vill ha dem.
 # Samma tabell som i "Tessera embeddings to GDB".
 DATASETS = {
-    "v1 (global, 2017-2025)":      ("v1", "v1"),
-    "v2 beta (delvis täckning)":   ("v2-2B-L~beta1", "v2"),
-    "v1.1 Cambridge (regional)":   ("v1.1-cam", "v1.1"),
+    "v1 (global, 2017-2025)":      ("v1", "vultr"),
+    "v1.1 Cambridge (regional)":   ("v1.1", "cambridge"),
+    "v2 beta (delvis täckning)":   ("v2", "2B-L~beta1"),
 }
 DEFAULT_DATASET = "v1 (global, 2017-2025)"
 
@@ -190,18 +205,72 @@ def _grid_name(lon, lat):
     return "grid_{:.2f}_{:.2f}".format(lon, lat)
 
 
-def _embedding_url(npy_dir, year, lon, lat):
+def _require_geotessera():
+    """Ge ett begripligt fel när paketet saknas i den aktiva Python-miljön."""
+    if GeoTessera is None:
+        import sys
+        raise ValueError(
+            "Paketet geotessera kunde inte laddas i den Python-miljö som ArcGIS Pro "
+            "använder ({}). Klona arcgispro-py3, installera geotessera i kloningen "
+            "och byt aktiv miljö i Pro under Settings, Package Manager. "
+            "Ursprungligt fel: {}".format(
+                os.path.basename(os.path.normpath(sys.prefix)), _GEOTESSERA_ERROR)
+        )
+
+
+# En klient per (version, variant, cache-mapp). Att öppna registret läser ett
+# manifest över samtliga publicerade tiles, så klienten återanvänds i sessionen.
+_client_cache = {}
+
+
+def _client(dataset, cache_dir, messages=None):
+    """GeoTessera-klient för en dataset-etikett, med landmasker i cache_dir."""
+    _require_geotessera()
+    if dataset not in DATASETS:
+        raise ValueError("Okänd dataset-version: {}".format(dataset))
+    version, variant = DATASETS[dataset]
+
+    key = (version, variant, os.path.abspath(str(cache_dir)))
+    if key in _client_cache:
+        return _client_cache[key]
+
+    if messages is not None:
+        messages.addMessage(
+            "Läser Tessera-registret ({} {})... första gången hämtas ett "
+            "manifest över alla tiles, vilket tar en stund.".format(version, variant)
+        )
+    try:
+        client = GeoTessera(dataset_version=version, dataset_variant=variant,
+                            embeddings_dir=str(cache_dir))
+    except Exception as exc:                                # noqa: BLE001
+        raise ValueError(
+            "Kunde inte läsa Tessera-registret för {} {}: {}".format(version, variant, exc)
+        )
+    _client_cache[key] = client
+    return client
+
+
+def _dataset_base(client, year):
+    """
+    Bas-URL för en tiles filer, byggd ur geotesseras egna konstanter.
+
+    Adressen härleds hellre än hårdkodas: geotessera 0.9 flyttade datat från
+    data.source.coop till S3, och den flytten ska slå igenom här utan att
+    sökvägar skrivs av för hand.
+    """
+    root = gt_registry.TESSERA_BASE_URL.rstrip("/")
+    version = client.registry._version_path if hasattr(client.registry, "_version_path")         else DATASETS[DEFAULT_DATASET][0]
+    return "{}/{}/{}/{}".format(root, version, gt_registry.EMBEDDINGS_DIR_NAME, year)
+
+
+def _embedding_url(client, year, lon, lat):
     name = _grid_name(lon, lat)
-    return "{}/npy/{}/{}/{}/{}.npy".format(BASE_URL, npy_dir, year, name, name)
+    return "{}/{}/{}.npy".format(_dataset_base(client, year), name, name)
 
 
-def _scales_url(npy_dir, year, lon, lat):
+def _scales_url(client, year, lon, lat):
     name = _grid_name(lon, lat)
-    return "{}/npy/{}/{}/{}/{}_scales.npy".format(BASE_URL, npy_dir, year, name, name)
-
-
-def _landmask_url(lm_dir, lon, lat):
-    return "{}/landmasks/{}/{}.tiff".format(BASE_URL, lm_dir, _grid_name(lon, lat))
+    return "{}/{}/{}_scales.npy".format(_dataset_base(client, year), name, name)
 
 
 # =============================================================================
@@ -212,9 +281,11 @@ def _request(url, start=None, length=None):
     """
     En begäran med User-Agent, och med Range-huvud när ett intervall begärs.
 
-    User-Agent är inte kosmetik: utan huvudet svarar data.source.coop 403.
-    Bara ett enda intervall per begäran — servern struntar i flerdelade
-    Range-huvuden och skickar hela filen i stället.
+    Bara ett enda intervall per begäran: servern struntar i flerdelade
+    Range-huvuden och skickar hela filen i stället, kontrollerat mot S3.
+    User-Agent krävdes av den tidigare spegeln på data.source.coop, som svarade
+    403 utan huvudet. S3 bryr sig inte, men huvudet skickas ändå så att anropen
+    går att känna igen i serverloggar.
     """
     headers = {"User-Agent": _USER_AGENT}
     if start is not None:
@@ -310,19 +381,17 @@ def _npy_header(url):
     return offset + header_len, tuple(info["shape"])
 
 
-def _fetch_landmask(lm_dir, lon, lat, cache_dir):
-    """Landmasken för en tile, hämtad en gång och sedan återanvänd ur cachen."""
-    folder = os.path.join(cache_dir, "landmasks", lm_dir)
-    path = os.path.join(folder, _grid_name(lon, lat) + ".tiff")
-    if os.path.isfile(path) and os.path.getsize(path) > 0:
-        return path
-    data = _http_bytes(_landmask_url(lm_dir, lon, lat))
-    os.makedirs(folder, exist_ok=True)
-    tmp = path + ".part"
-    with open(tmp, "wb") as fh:
-        fh.write(data)
-    os.replace(tmp, path)
-    return path
+def _fetch_landmask(client, lon, lat):
+    """
+    Landmasken för en tile. geotessera hämtar den en gång till cache-mappen och
+    återanvänder den sedan, så den är billig att be om per fyndpunkt.
+    """
+    try:
+        return client.registry.fetch_landmask(lon=lon, lat=lat)
+    except Exception as exc:                                # noqa: BLE001
+        raise _TileMissing(
+            "Landmasken för {} kunde inte hämtas: {}".format(_grid_name(lon, lat), exc)
+        )
 
 
 # =============================================================================
@@ -360,16 +429,16 @@ class _TileSource:
     __slots__ = ("lon", "lat", "emb_url", "sca_url", "emb_offset", "sca_offset",
                  "height", "width", "sr", "extent", "cell_w", "cell_h", "landmask")
 
-    def __init__(self, npy_dir, year, lon, lat):
+    def __init__(self, client, year, lon, lat):
         self.lon = lon
         self.lat = lat
-        self.emb_url = _embedding_url(npy_dir, year, lon, lat)
-        self.sca_url = _scales_url(npy_dir, year, lon, lat)
+        self.emb_url = _embedding_url(client, year, lon, lat)
+        self.sca_url = _scales_url(client, year, lon, lat)
 
-    def load_remote(self, lm_dir, cache_dir):
+    def load_remote(self, client):
         """Nätverksdelen: landmask till cachen och båda .npy-huvudena.
         Innehåller inga arcpy-anrop och kan därför köras i en trådpool."""
-        self.landmask = _fetch_landmask(lm_dir, self.lon, self.lat, cache_dir)
+        self.landmask = _fetch_landmask(client, self.lon, self.lat)
         self.emb_offset, emb_shape = _npy_header(self.emb_url)
         self.sca_offset, sca_shape = _npy_header(self.sca_url)
 
@@ -528,8 +597,7 @@ def _read_observations(points, messages):
     return observations
 
 
-def _sample_observations(observations, npy_dir, lm_dir, year, radius, cache_dir,
-                         messages):
+def _sample_observations(observations, client, year, radius, messages):
     """
     Hämta embedding-vektorn för varje fyndpunkt med Range-anrop.
 
@@ -548,8 +616,8 @@ def _sample_observations(observations, npy_dir, lm_dir, year, radius, cache_dir,
     with concurrent.futures.ThreadPoolExecutor(max_workers=_WORKERS) as pool:
         futures = {}
         for lon, lat in tiles:
-            source = _TileSource(npy_dir, year, lon, lat)
-            futures[pool.submit(source.load_remote, lm_dir, cache_dir)] = (lon, lat, source)
+            source = _TileSource(client, year, lon, lat)
+            futures[pool.submit(source.load_remote, client)] = (lon, lat, source)
         for future in concurrent.futures.as_completed(futures):
             lon, lat, source = futures[future]
             try:
@@ -964,7 +1032,22 @@ def _default_gdb():
 
 
 def _default_cache_dir():
-    return os.path.join(tempfile.gettempdir(), _CACHE_DIRNAME)
+    """
+    Standardmapp för landmasker, skapad om den saknas.
+
+    Inte tempfile.gettempdir(): inne i Pro pekar den på en egen mapp per session
+    (ArcGISProTemp<nnnn>) som ofta blir kvar när Pro stängs. En sådan sökväg
+    finns inte förrän någon skapar den, vilket får DEFolder-parametern att falla
+    på ERROR 000732 redan när dialogen öppnas, och namnet byts vid varje omstart
+    så att ingenting återanvänds.
+    """
+    base = os.environ.get("LOCALAPPDATA") or tempfile.gettempdir()
+    path = os.path.join(base, _CACHE_DIRNAME)
+    try:
+        os.makedirs(path, exist_ok=True)
+    except OSError:
+        pass
+    return path
 
 
 def _looks_synced(path):
@@ -1418,7 +1501,17 @@ def _run(points, raster_path, channels_text, year, dataset, radius, cache_dir,
 
     if dataset not in DATASETS:
         raise ValueError("Okänd dataset-version: {}.".format(dataset))
-    npy_dir, lm_dir = DATASETS[dataset]
+
+    # Cache-mappen måste vara bestämd innan klienten skapas: den avgör var
+    # geotessera lägger landmaskerna.
+    cache_dir = cache_dir or _default_cache_dir()
+    if _looks_synced(cache_dir):
+        messages.addWarningMessage(
+            "Cache-mappen {} ser ut att synkas till molnet.".format(cache_dir)
+        )
+    os.makedirs(cache_dir, exist_ok=True)
+    client = _client(dataset, cache_dir, messages)
+
     if year not in YEARS:
         raise ValueError("Okänt år: {}.".format(year))
     aggregation = aggregation or AGG_MAX
@@ -1461,16 +1554,9 @@ def _run(points, raster_path, channels_text, year, dataset, radius, cache_dir,
                 raster.width, raster.height)
         )
 
-    cache_dir = cache_dir or _default_cache_dir()
-    if _looks_synced(cache_dir):
-        messages.addWarningMessage(
-            "Cache-mappen {} ser ut att synkas till molnet.".format(cache_dir)
-        )
-    os.makedirs(cache_dir, exist_ok=True)
-
     observations = _read_observations(points, messages)
     used = _sample_observations(
-        observations, npy_dir, lm_dir, year, radius or 0.0, cache_dir, messages)
+        observations, client, year, radius or 0.0, messages)
 
     if drop_pct and drop_pct > 0:
         used = _drop_outliers(used, drop_pct, messages)

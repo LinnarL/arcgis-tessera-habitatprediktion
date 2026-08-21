@@ -5,12 +5,13 @@ already known to occur. It looks up the Tessera embedding at each observation, t
 pixel of a search raster by how much it resembles those known sites. High values mean the place
 looks like the places the species has been found.
 
-The observations are read straight out of Tessera's published files with HTTP range requests, one
-pixel at a time. Nothing is downloaded in bulk. A tile is about 90 MB and occurrence data for a
-species is typically spread across a whole region, so downloading a tile per observation is not
-workable. The files are uncompressed `.npy`, so a single pixel's 128 channel vector is 128
-contiguous bytes at a computable offset. Cost per observation is two small requests, plus one
-13.6 kB landmask per tile that is cached and reused.
+The tile registry and the landmasks come from the `geotessera` package. The observations
+themselves do not: they are read straight out of Tessera's published files with HTTP range
+requests, one pixel at a time. A tile is about 90 MB and geotessera always fetches whole tiles,
+while occurrence data for a species is typically spread across a whole region, so a tile per
+observation is not workable. The files are uncompressed `.npy`, so a single pixel's 128 channel
+vector is 128 contiguous bytes at a computable offset. Measured cost per observation is about
+0.6 kB, plus one 13.6 kB landmask per tile that is cached and reused.
 
 The similarity itself is the same dot product method as "Tessera similarity search" in this
 project, which follows Google Earth Engine's similarity search tutorial.
@@ -19,16 +20,33 @@ https://developers.google.com/earth-engine/tutorials/community/satellite-embeddi
 
 ## Requirements
 
-- ArcGIS Pro 3.x. Developed and tested on 3.6 with Python 3.13.
-- No dependencies beyond `arcpy`, `numpy` and the standard library. No Spatial Analyst or 3D
+- ArcGIS Pro 3.x. Developed and tested on 3.6 with Python 3.13. No Spatial Analyst or 3D
   Analyst extension is needed.
-- Internet access to `data.source.coop`.
+- The `geotessera` package, for the tile registry and the landmasks.
+- Internet access to `s3.us-west-2.amazonaws.com`.
+
+`geotessera` is not part of the default `arcgispro-py3` environment, and ArcGIS Pro does not
+allow installing into it. Clone the environment first.
 
 ## Install
 
-1. Clone or download this repo.
-2. In ArcGIS Pro: Catalog, Toolboxes, Add Toolbox, select `TesseraHabitat.pyt`.
-3. Open Tessera habitat, Habitatprediktion från fyndpunkter.
+1. In ArcGIS Pro: Settings, Package Manager, clone the active environment. Name the clone
+   something like `arcgispro-py3-personal` and make it active.
+2. Install geotessera into the clone, then pin pyarrow back to the version Pro supports.
+   geotessera pulls a newer pyarrow that fails to load once `arcpy` is imported, which breaks
+   the registry:
+
+   ```
+   python -m pip install geotessera
+   python -m pip install "pyarrow==20.0.0"
+   ```
+
+3. Clone or download this repo.
+4. In ArcGIS Pro: Catalog, Toolboxes, Add Toolbox, select `TesseraHabitat.pyt`.
+5. Open Tessera habitat, Habitatprediktion från fyndpunkter.
+
+If the environment is wrong the tool stops with a message naming the active environment rather
+than failing part way through.
 
 ## The tool dialog
 
@@ -126,6 +144,7 @@ predicted area. Entering 10 under `Tröskel som percentil av fyndens likhet` doe
 
 ## Source
 
-- Data: https://data.source.coop/tessera/tessera
+- Project: https://geotessera.org/
+- Library: https://github.com/ucam-eo/geotessera
 - Project: https://geotessera.org/
 - Method: https://developers.google.com/earth-engine/tutorials/community/satellite-embedding-05-similarity-search
