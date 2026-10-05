@@ -1,4 +1,4 @@
-# Embedding habitat prediction
+# Tessera habitatprediktion
 
 ArcGIS Pro Python toolbox that predicts where a species could occur, from points where it is
 already known to occur. It looks up the Tessera embedding at each observation, then scores every
@@ -42,7 +42,7 @@ allow installing into it. Clone the environment first.
    ```
 
 3. Clone or download this repo.
-4. In ArcGIS Pro: Catalog, Toolboxes, Add Toolbox, select `TesseraHabitat.pyt`.
+4. In ArcGIS Pro: Catalog, Toolboxes, Add Toolbox, select `TesseraHabitatprediktion.pyt`.
 5. Open Tessera habitat, Habitatprediktion från fyndpunkter.
 
 If the environment is wrong the tool stops with a message naming the active environment rather

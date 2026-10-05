@@ -1,6 +1,6 @@
 # -*- coding: utf-8 -*-
 """
-TesseraHabitat.pyt
+TesseraHabitatprediktion.pyt
 
 Habitatprediktion ur Tessera-embeddings: utgå från kända fyndpunkter för en art,
 hämta embedding-vektorn i varje fyndpunkt, och måla ut ett likhetsraster över ett
@@ -116,7 +116,7 @@ STATUS_DROPPED = "utesluten"
 STATUS_NODATA = "saknar data"
 STATUS_NOTILE = "ingen tile"
 
-_USER_AGENT = "TesseraHabitat.pyt (ArcGIS Pro)"
+_USER_AGENT = "TesseraHabitatprediktion.pyt (ArcGIS Pro)"
 _HTTP_TIMEOUT = 120
 _HTTP_ATTEMPTS = 4
 _RETRY_STATUS = (408, 429, 500, 502, 503, 504)
@@ -1151,8 +1151,8 @@ def _channels_for_raster(text, band_count):
 
 class Toolbox:
     def __init__(self):
-        self.label = "Tessera habitat"
-        self.alias = "tesserahabitat"
+        self.label = "Tessera habitatprediktion"
+        self.alias = "tessera_habitat"
         self.tools = [HabitatPrediktion]
 
 
